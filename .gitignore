@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/bronze/
+data/silver/
+data/dlq/
+data/checkpoints/
+data/schema_registry.db
+.DS_Store
