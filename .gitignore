@@ -10,3 +10,6 @@ data/dlq/
 data/checkpoints/
 data/schema_registry.db
 .DS_Store
+
+.pytest_cache/
+*.log

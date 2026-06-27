@@ -1,40 +1,36 @@
-# ⚡ Real-Time Streaming Pipeline — Kafka + PySpark + Delta Lake
+# Real-Time Streaming Pipeline — Kafka + PySpark + Delta Lake
 
-A production-style streaming data pipeline that runs entirely on your MacBook Air using Docker. Simulates real-world event streaming with schema evolution handling, schema registry, Parquet/Delta sink, and a live monitoring dashboard.
+A production-style streaming data pipeline that runs entirely on your MacBook Air using Docker. Simulates real-world event streaming with schema evolution handling, Parquet/Delta Lake sink, dead letter queue (DLQ), and a live monitoring dashboard.
 
 Mirrors GCP Pub/Sub → Dataflow → BigQuery architectures using open-source equivalents.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 [Event Producer]
-  Python script simulating stock tick events
+  Python script simulating stock tick events (v1 + v2 schema)
         │
-        ▼ Kafka Topic: raw-events
-[Schema Registry]          ← validates & enforces Avro schema
-        │
-        ▼ Kafka Topic: validated-events
+        ▼ Kafka Topic: raw-events (3 partitions)
 [PySpark Structured Streaming]
   - Parses JSON events
-  - Applies schema validation
-  - Handles schema evolution (new fields, type changes)
-  - Writes micro-batches to Delta Lake sink
+  - Routes invalid events to DLQ
+  - Handles schema evolution (new fields detected automatically)
+  - Writes micro-batches every 10 seconds
         │
-        ▼
-[Delta Lake — Bronze/Silver layers]
-  ./data/bronze/   ← raw validated events (Parquet)
-  ./data/silver/   ← cleaned, deduplicated, enriched
+        ├──▶ data/bronze/   ← raw events (partitioned by exchange + schema_version)
+        ├──▶ data/silver/   ← valid, enriched events (spread, mid_price added)
+        └──▶ data/dlq/      ← malformed events (null symbol, bad price type)
         │
         ▼
 [Streamlit Monitoring Dashboard]
-  Live metrics: throughput, lag, schema alerts
+  Live metrics: Bronze/Silver counts, DLQ rate, price chart, schema evolution log
 ```
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 | Component | Tool | GCP Equivalent |
 |-----------|------|----------------|
@@ -43,162 +39,140 @@ Mirrors GCP Pub/Sub → Dataflow → BigQuery architectures using open-source eq
 | Storage Format | Delta Lake (Parquet) | BigQuery / GCS |
 | Schema Registry | Confluent Schema Registry (Docker) | Pub/Sub schemas |
 | Monitoring | Streamlit Dashboard | Cloud Monitoring |
-| Orchestration | Python scripts | Cloud Composer |
+| Kafka Client | kafka-python-ng | — |
+| Package Manager | uv | — |
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 streaming-pipeline/
 ├── README.md
-├── requirements.txt
+├── pyproject.toml               # uv project config & dependencies
+├── uv.lock                      # locked dependency versions
+├── requirements.txt             # legacy reference (uv is used instead)
+├── start.sh                     # one-command pipeline startup
+├── stop.sh                      # stop all pipeline processes
 ├── docker/
-│   └── docker-compose.yml       # Kafka + Zookeeper + Schema Registry
+│   └── docker-compose.yml       # Kafka + Zookeeper + Schema Registry + Kafka UI
 ├── src/
 │   ├── __init__.py
-│   ├── producer.py              # Simulates stock tick event producer
+│   ├── producer.py              # stock tick event producer (v1 + v2 schema)
 │   ├── spark_consumer.py        # PySpark Structured Streaming consumer
-│   ├── schema_registry.py       # Schema validation & evolution handler
-│   └── delta_writer.py          # Delta Lake sink with bronze/silver layers
+│   └── schema_registry.py      # schema validation & evolution handler
 ├── data/
-│   ├── bronze/                  # Auto-created: raw event sink
-│   └── silver/                  # Auto-created: cleaned event sink
+│   ├── bronze/                  # auto-created: raw event Delta sink
+│   ├── silver/                  # auto-created: cleaned + enriched Delta sink
+│   ├── dlq/                     # auto-created: dead letter queue
+│   └── checkpoints/             # Spark streaming checkpoints
 ├── dashboards/
 │   └── monitor.py               # Streamlit live monitoring dashboard
-├── tests/
-│   ├── __init__.py
-│   ├── test_producer.py
-│   └── test_schema_registry.py
-└── scripts/
-    ├── start_pipeline.sh        # One-command pipeline startup
-    └── reset.sh                 # Clean all data and restart
+└── tests/
+    ├── __init__.py
+    ├── test_producer.py
+    └── test_schema_registry.py
 ```
 
 ---
 
-## 🚀 Setup & Installation
+## Setup & Installation
 
 ### Prerequisites
 - macOS (Apple Silicon or Intel)
 - Docker Desktop installed and running
-- Python 3.10+
-- Java 11+ (required for PySpark): `brew install openjdk@11`
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) — `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- Java 11 (required for PySpark): `brew install openjdk@11`
 
-### Step 1 — Install Java (PySpark dependency)
+### Step 1 — Install Java
 ```bash
 brew install openjdk@11
 
-# Add to your shell profile (~/.zshrc or ~/.bash_profile):
+# Add to ~/.zshrc:
 export JAVA_HOME=/opt/homebrew/opt/openjdk@11
 export PATH="$JAVA_HOME/bin:$PATH"
 
-# Reload shell
 source ~/.zshrc
-java -version   # Should show openjdk 11
+java -version   # should show openjdk 11
 ```
 
-### Step 2 — Start Kafka with Docker
+### Step 2 — Install dependencies
 ```bash
-cd docker/
-docker-compose up -d
-
-# Verify all containers are running
-docker-compose ps
-# You should see: zookeeper, kafka, schema-registry all "Up"
-
-# Wait ~30 seconds for Kafka to be fully ready, then create topics
-docker exec -it kafka kafka-topics.sh \
-  --create --topic raw-events \
-  --bootstrap-server localhost:9092 \
-  --partitions 3 --replication-factor 1
-
-docker exec -it kafka kafka-topics.sh \
-  --create --topic validated-events \
-  --bootstrap-server localhost:9092 \
-  --partitions 3 --replication-factor 1
-
-# Verify topics created
-docker exec -it kafka kafka-topics.sh --list --bootstrap-server localhost:9092
+git clone https://github.com/YOUR_USERNAME/streaming-pipeline.git
+cd streaming-pipeline
+uv sync
 ```
 
-### Step 3 — Set Up Python Environment
+### Step 3 — Start the full pipeline
 ```bash
-cd ..   # back to project root
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+./start.sh
 ```
 
-### Step 4 — Run the Full Pipeline
+This script automatically:
+1. Starts the Kafka Docker stack (Zookeeper, Kafka, Schema Registry, Kafka UI)
+2. Creates `raw-events` and `validated-events` topics
+3. Starts the PySpark Structured Streaming consumer
+4. Launches the Streamlit monitoring dashboard on http://localhost:8503
 
-Open 3 terminal tabs:
-
-**Tab 1 — Start the Spark Consumer (reads from Kafka, writes Delta)**
+### Step 4 — Send events
 ```bash
-source venv/bin/activate
-python src/spark_consumer.py
-# Wait for "Awaiting first micro-batch..." message
+# v1 schema — 10 events/sec for 5 minutes
+uv run python src/producer.py --events-per-second 10 --duration 300
 ```
 
-**Tab 2 — Start the Event Producer (sends events to Kafka)**
+### Step 5 — Demo schema evolution (optional)
 ```bash
-source venv/bin/activate
-python src/producer.py --events-per-second 10 --duration 300
-# Sends 10 events/sec for 5 minutes
-```
-
-**Tab 3 — Launch the Monitoring Dashboard**
-```bash
-source venv/bin/activate
-streamlit run dashboards/monitor.py
-# Open http://localhost:8501
-```
-
-### Step 5 — Trigger Schema Evolution (Optional Demo)
-```bash
-# After pipeline is running, send events with a new field
-python src/producer.py --schema-version v2 --events-per-second 5 --duration 60
-# Watch the dashboard show schema evolution alerts
+# v2 schema adds analyst_rating + market_cap_billions fields
+uv run python src/producer.py --schema-version v2 --events-per-second 10 --duration 120
+# Watch the dashboard show new fields appearing in silver layer
 ```
 
 ---
 
-## 🧪 Running Tests
+## Monitoring
+
+| URL | What you see |
+|-----|-------------|
+| http://localhost:8503 | Streamlit dashboard — Bronze/Silver/DLQ counts, price chart, schema log |
+| http://localhost:8080 | Kafka UI — topic lag, partition offsets, consumer groups |
+
+---
+
+## Running Tests
 ```bash
-pytest tests/ -v
+uv run pytest tests/ -v
 ```
 
 ---
 
-## 🔧 Resetting the Pipeline
+## Stopping the Pipeline
 ```bash
-bash scripts/reset.sh
-# Stops Spark, clears Delta tables, resets Kafka offsets
+./stop.sh
+# Kills Spark consumer, producer, dashboard, and brings Docker stack down
 ```
 
 ---
 
-## 📈 Key Engineering Concepts Demonstrated
+## Key Engineering Concepts Demonstrated
 
 - **Micro-batch streaming** with PySpark's `trigger(processingTime="10 seconds")`
 - **Schema evolution** — detecting and handling new fields in incoming events without breaking the pipeline
-- **Exactly-once semantics** — Kafka offset management + Delta Lake ACID transactions
-- **Bronze/Silver lakehouse layers** — raw ingestion vs. cleaned, deduplicated data
-- **Consumer lag monitoring** — tracking how far behind the consumer is from the producer
+- **Bronze/Silver/DLQ lakehouse layers** — raw ingestion, cleaned data, and rejected events as first-class citizens
+- **Dead letter queue** — ~5% intentionally malformed events are routed to DLQ with a rejection reason
 - **Fault tolerance** — checkpoint directories allow the Spark job to resume after restart
+- **Derived enrichment** — Silver layer adds `spread` and `mid_price` columns computed from raw tick data
 
 ---
 
-## 🌱 Potential Extensions
+## Potential Extensions
 - Add a Gold layer with aggregated metrics (VWAP, moving averages)
 - Replace local Delta Lake with GCS + BigQuery for GCP deployment
 - Add Avro serialization via Confluent Schema Registry client
-- Implement dead letter queue (DLQ) for malformed events
 - Deploy producer as a Cloud Run job, consumer as Dataflow
 
 ---
 
-## 👤 Author
+## Author
 **Aritra Ghorai** — Senior Data Engineer  
 [LinkedIn](https://linkedin.com/in/YOUR_PROFILE) | [GitHub](https://github.com/YOUR_USERNAME)
